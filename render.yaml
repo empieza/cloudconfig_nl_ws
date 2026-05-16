@@ -1,0 +1,21 @@
+# Render.com Blueprint для автоматического развертывания
+# https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: curwe-cloudconfig-ws
+    env: node
+    region: frankfurt
+    plan: free
+    branch: main
+    rootDir: api/cloudconfig_ws
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: CLOUD_API_SECRET
+        sync: false
+      - key: CLOUD_ADMIN_SECRET
+        generateValue: true
+      - key: DATA_DIR
+        value: /opt/render/project/data
+    healthCheckPath: /health

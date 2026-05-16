@@ -1,6 +1,7 @@
 /**
  * WebSocket сервер для облачных конфигов Neverlose
  * Полный перенос логики из PHP api/cloudconfig/*
+ * + Онлайн пользователи скриптов
  * 
  * Развертывание на Render.com:
  * 1. Создать новый Web Service
@@ -12,6 +13,8 @@
 const WebSocket = require('ws');
 const http = require('http');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const store = require('./store');
 
 // ============================================
@@ -22,9 +25,77 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 const API_SECRET = process.env.CLOUD_API_SECRET || '';
 const ADMIN_SECRET = process.env.CLOUD_ADMIN_SECRET || '';
 
+// Онлайн пользователи
+const ONLINE_TTL_MS = Math.max(10000, Math.min(parseInt(process.env.SCRIPT_ONLINE_TTL_MS || process.env.ONLINE_TTL_MS || '60000', 10), 600000));
+const ONLINE_DATA_FILE = path.join(__dirname, '../../data/script_online.json');
+
 if (!API_SECRET || API_SECRET.length < 16) {
     console.error('[ERROR] CLOUD_API_SECRET not configured or too short');
     process.exit(1);
+}
+
+// ============================================
+// ОНЛАЙН ПОЛЬЗОВАТЕЛИ (из script-online)
+// ============================================
+
+function readOnlineData() {
+    try {
+        if (!fs.existsSync(ONLINE_DATA_FILE)) return {};
+        const raw = fs.readFileSync(ONLINE_DATA_FILE, 'utf8');
+        const j = JSON.parse(raw);
+        return (typeof j === 'object' && j !== null) ? j : {};
+    } catch {
+        return {};
+    }
+}
+
+function writeOnlineData(data) {
+    const dir = path.dirname(ONLINE_DATA_FILE);
+    if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(ONLINE_DATA_FILE, JSON.stringify(data), 'utf8');
+}
+
+function onlineStorageKey(username) {
+    return crypto.createHash('sha256').update('nl_script_online:' + username.toLowerCase()).digest('hex');
+}
+
+function pruneStaleOnline(nowMs) {
+    const grace = Math.max(ONLINE_TTL_MS * 2, ONLINE_TTL_MS + 1);
+    const data = readOnlineData();
+    const out = {};
+    let changed = false;
+    for (const [key, row] of Object.entries(data)) {
+        if (!row || typeof row !== 'object') continue;
+        const last = parseInt(row.lastSeen || 0, 10);
+        if (nowMs - last <= grace) {
+            out[key] = row;
+        } else {
+            changed = true;
+        }
+    }
+    if (changed) writeOnlineData(out);
+    return out;
+}
+
+function pingOnlineUser(username, nowMs) {
+    const data = readOnlineData();
+    const key = onlineStorageKey(username);
+    data[key] = { nl_username: username, lastSeen: nowMs };
+    writeOnlineData(data);
+}
+
+function getOnlineCount(nowMs) {
+    pruneStaleOnline(nowMs);
+    const data = readOnlineData();
+    let n = 0;
+    for (const row of Object.values(data)) {
+        if (!row || typeof row !== 'object') continue;
+        const last = parseInt(row.lastSeen || 0, 10);
+        if (nowMs - last <= ONLINE_TTL_MS) ++n;
+    }
+    return n;
 }
 
 // ============================================
@@ -39,6 +110,14 @@ const server = http.createServer((req, res) => {
             service: 'curwe-cloudconfig-ws',
             timestamp: new Date().toISOString()
         }));
+        return;
+    }
+    
+    // HTTP endpoint for online count (backwards compatibility)
+    if (req.url === '/connection_count') {
+        const count = getOnlineCount(Date.now());
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ count, ttl_ms: ONLINE_TTL_MS }));
         return;
     }
     
@@ -322,6 +401,39 @@ const handlers = {
     admin_dump: (ws, data) => {
         const all = store.allByCreator();
         return { ok: true, dump: all };
+    },
+    
+    /**
+     * Онлайн: пинг пользователя (подтверждение активности)
+     */
+    ping: (ws, data) => {
+        const username = store.sanitizeUsername(data.username || '');
+        if (!username) {
+            return { ok: false, error: 'invalid_username' };
+        }
+        const nowMs = Date.now();
+        pingOnlineUser(username, nowMs);
+        const count = getOnlineCount(nowMs);
+        return {
+            ok: true,
+            action: 'pong',
+            ttl_ms: ONLINE_TTL_MS,
+            count
+        };
+    },
+    
+    /**
+     * Онлайн: получить количество онлайн пользователей
+     */
+    online_count: (ws, data) => {
+        const nowMs = Date.now();
+        const count = getOnlineCount(nowMs);
+        return {
+            ok: true,
+            action: 'online-count',
+            count,
+            ttl_ms: ONLINE_TTL_MS
+        };
     }
 };
 
@@ -410,7 +522,9 @@ wss.on('connection', (ws, req) => {
     sendJson(ws, { 
         type: 'welcome', 
         message: 'Connected to Curwe CloudConfig WebSocket',
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        online_count: getOnlineCount(Date.now()),
+        ttl_ms: ONLINE_TTL_MS
     });
 });
 

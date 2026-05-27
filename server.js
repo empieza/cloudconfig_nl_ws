@@ -11,6 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const store = require('./store');
+const leaderboard = require('./leaderboard_store');
 
 // ============================================
 // КОНФИГУРАЦИЯ
@@ -124,10 +125,31 @@ const server = http.createServer((req, res) => {
     }
     
     // HTTP endpoint for online count (backwards compatibility)
-    if (req.url === '/connection_count') {
+    if (req.url === '/connection_count' || req.url.startsWith('/connection_count?')) {
         const count = getOnlineCount(Date.now());
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ count, ttl_ms: ONLINE_TTL_MS }));
+        return;
+    }
+
+    // Public leaderboard (для сайта curwe-site)
+    let reqPath = req.url || '/';
+    if (reqPath.indexOf('?') >= 0) {
+        reqPath = reqPath.split('?')[0];
+    }
+    if (reqPath === '/leaderboard' && req.method === 'GET') {
+        try {
+            const u = new URL(req.url, 'http://127.0.0.1');
+            const app = store.sanitizeApp(u.searchParams.get('app') || 'default');
+            const page = u.searchParams.get('page') || '1';
+            const perPage = u.searchParams.get('per_page') || '20';
+            const result = leaderboard.listTop(app, page, perPage);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(result));
+        } catch (e) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'server_error' }));
+        }
         return;
     }
     
@@ -453,6 +475,30 @@ const handlers = {
             count,
             ttl_ms: ONLINE_TTL_MS
         };
+    },
+
+    /**
+     * Leaderboard: синхронизация очков/статистики с клиента
+     */
+    leaderboard_sync: (ws, data) => {
+        const username = store.sanitizeUsername(data.username || '');
+        const app = store.sanitizeApp(data.app || data.script || 'default');
+        if (!username) {
+            return { ok: false, error: 'invalid_username' };
+        }
+        const delta = data.delta || data.stats || {};
+        const ping = data.ping_online !== false && data.session_ping !== false;
+        return leaderboard.applySync(app, username, delta, ping);
+    },
+
+    /**
+     * Leaderboard: топ для Lua list (до 30 строк)
+     */
+    leaderboard_list: (ws, data) => {
+        const app = store.sanitizeApp(data.app || data.script || 'default');
+        const limit = parseInt(data.limit, 10) || 15;
+        const result = leaderboard.listTopForLua(app, limit);
+        return result;
     }
 };
 

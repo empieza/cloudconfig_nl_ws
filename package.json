@@ -1,17 +1,29 @@
 {
-  "name": "curwe-cloudconfig-ws",
-  "version": "1.0.0",
-  "description": "WebSocket server for Neverlose cloud configs",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
-  },
-  "dependencies": {
-    "ws": "^8.16.0",
-    "uuid": "^9.0.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "name": "curwe-cloudconfig-ws",
+    "version": "1.0.0",
+    "description": "WebSocket server for Neverlose cloud configs",
+    "main": "server.js",
+    "scripts": {
+      "start": "node server.js",
+      "start:prod": "pm2 start ecosystem.config.js",
+      "stop": "pm2 stop curwe-cloudconfig-ws",
+      "restart": "pm2 restart curwe-cloudconfig-ws",
+      "reload": "pm2 reload curwe-cloudconfig-ws",
+      "delete": "pm2 delete curwe-cloudconfig-ws",
+      "logs": "pm2 logs curwe-cloudconfig-ws",
+      "status": "pm2 status",
+      "monit": "pm2 monit",
+      "setup": "chmod +x install.sh && ./install.sh"
+    },
+    "dependencies": {
+      "ws": "^8.16.0",
+      "uuid": "^9.0.0",
+      "dotenv": "^16.3.1"
+    },
+    "devDependencies": {
+      "pm2": "^5.3.0"
+    },
+    "engines": {
+      "node": ">=18.0.0"
+    }
   }
-}

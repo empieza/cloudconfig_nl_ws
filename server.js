@@ -1,14 +1,9 @@
 /**
  * WebSocket сервер для облачных конфигов Neverlose
- * Полный перенос логики из PHP api/cloudconfig/*
- * + Онлайн пользователи скриптов
- * 
- * Развертывание на Render.com:
- * 1. Создать новый Web Service
- * 2. Указать путь к этой папке
- * 3. Build command: npm install
- * 4. Start command: npm start
+ * Адаптировано для FirstVDS.ru
  */
+
+require('dotenv').config();
 
 const WebSocket = require('ws');
 const http = require('http');
@@ -22,12 +17,15 @@ const store = require('./store');
 // ============================================
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
+const HOST = process.env.HOST || '0.0.0.0';
 const API_SECRET = process.env.CLOUD_API_SECRET || '';
 const ADMIN_SECRET = process.env.CLOUD_ADMIN_SECRET || '';
 
 // Онлайн пользователи
-const ONLINE_TTL_MS = Math.max(10000, Math.min(parseInt(process.env.SCRIPT_ONLINE_TTL_MS || process.env.ONLINE_TTL_MS || '60000', 10), 600000));
-const ONLINE_DATA_FILE = path.join(__dirname, '../../data/script_online.json');
+const ONLINE_TTL_MS = Math.max(10000, Math.min(parseInt(process.env.SCRIPT_ONLINE_TTL_MS || '60000', 10), 600000));
+const ONLINE_DATA_FILE = process.env.DATA_DIR 
+    ? path.join(process.env.DATA_DIR, 'script_online.json')
+    : path.join(__dirname, '../../data/script_online.json');
 
 if (!API_SECRET || API_SECRET.length < 16) {
     console.error('[ERROR] CLOUD_API_SECRET not configured or too short');
@@ -99,16 +97,28 @@ function getOnlineCount(nowMs) {
 }
 
 // ============================================
-// HTTP СЕРВЕР (для health check на Render)
+// HTTP СЕРВЕР (для health check)
 // ============================================
 
 const server = http.createServer((req, res) => {
+    // CORS headers
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    
+    if (req.method === 'OPTIONS') {
+        res.writeHead(200);
+        res.end();
+        return;
+    }
+    
     if (req.url === '/health' || req.url === '/') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ 
             status: 'ok', 
             service: 'curwe-cloudconfig-ws',
-            timestamp: new Date().toISOString()
+            timestamp: new Date().toISOString(),
+            uptime: process.uptime()
         }));
         return;
     }
@@ -199,6 +209,7 @@ const handlers = {
     list: (ws, data) => {
         const username = data.username || '';
         const sanitized = store.sanitizeUsername(username);
+        const app = store.sanitizeApp(data.app || data.script || data.namespace || 'default');
         
         if (!sanitized) {
             return { ok: false, error: 'invalid_username' };
@@ -209,15 +220,15 @@ const handlers = {
         
         let list;
         if (mineOnly) {
-            list = store.listForUser(sanitized);
+            list = store.listForUserApp(app, sanitized);
         } else {
-            list = store.listPublic();
+            list = store.listPublicApp(app);
         }
         
         // Добавляем данные о лайках
-        list = list.map(entry => store.enrichEntryLikes(entry, sanitized));
+        list = list.map(entry => store.enrichEntryLikesForApp(app, entry, sanitized));
         
-        return { ok: true, configs: list };
+        return { ok: true, app, configs: list };
     },
     
     /**
@@ -225,12 +236,13 @@ const handlers = {
      */
     load: (ws, data) => {
         const id = data.id || '';
+        const app = store.sanitizeApp(data.app || data.script || data.namespace || 'default');
         
         if (!id || !/^[a-f0-9]{32}$/.test(id)) {
             return { ok: false, error: 'invalid_id' };
         }
         
-        const config = store.findPublicById(id);
+        const config = store.findPublicByIdApp(app, id);
         
         if (!config) {
             return { ok: false, error: 'not_found' };
@@ -238,6 +250,7 @@ const handlers = {
         
         return {
             ok: true,
+            app,
             id: String(config.id || ''),
             name: String(config.name || ''),
             created_at: String(config.created_at || ''),
@@ -254,6 +267,7 @@ const handlers = {
      */
     save: (ws, data) => {
         const username = store.sanitizeUsername(data.username || '');
+        const app = store.sanitizeApp(data.app || data.script || data.namespace || 'default');
         
         if (!username) {
             return { ok: false, error: 'invalid_username' };
@@ -280,8 +294,8 @@ const handlers = {
         }
         
         try {
-            const meta = store.save(username, name, payloadB64, existingId);
-            return { ok: true, config: meta };
+            const meta = store.saveApp(app, username, name, payloadB64, existingId);
+            return { ok: true, app, config: meta };
         } catch (e) {
             if (e.message === 'forbidden') {
                 return { ok: false, error: 'forbidden' };
@@ -298,6 +312,7 @@ const handlers = {
      */
     delete: (ws, data) => {
         const username = store.sanitizeUsername(data.username || '');
+        const app = store.sanitizeApp(data.app || data.script || data.namespace || 'default');
         
         if (!username) {
             return { ok: false, error: 'invalid_username' };
@@ -308,10 +323,10 @@ const handlers = {
             return { ok: false, error: 'invalid_id' };
         }
         
-        const result = store.deleteConfig(username, id);
+        const result = store.deleteConfigApp(app, username, id);
         
         if (result.removed) {
-            return { ok: true };
+            return { ok: true, app };
         }
         
         return { ok: false, error: result.error || 'not_found' };
@@ -322,6 +337,7 @@ const handlers = {
      */
     like: (ws, data) => {
         const username = store.sanitizeUsername(data.username || '');
+        const app = store.sanitizeApp(data.app || data.script || data.namespace || 'default');
         
         if (!username) {
             return { ok: false, error: 'invalid_username' };
@@ -332,8 +348,8 @@ const handlers = {
             return { ok: false, error: 'invalid_id' };
         }
         
-        const result = store.likeToggle(id, username);
-        return result;
+        const result = store.likeToggleForApp(app, id, username);
+        return { ...result, app };
     },
     
     /**
@@ -341,6 +357,7 @@ const handlers = {
      */
     meta: (ws, data) => {
         const username = store.sanitizeUsername(data.username || '');
+        const app = store.sanitizeApp(data.app || data.script || data.namespace || 'default');
         
         if (!username) {
             return { ok: false, error: 'invalid_username' };
@@ -372,11 +389,11 @@ const handlers = {
         }
         
         try {
-            const meta = store.setMeta(username, id, isPinned, nameColor);
+            const meta = store.setMetaApp(app, username, id, isPinned, nameColor);
             if (!meta) {
                 return { ok: false, error: 'not_found' };
             }
-            return { ok: true, config: meta };
+            return { ok: true, app, config: meta };
         } catch (e) {
             if (e.message === 'forbidden') {
                 return { ok: false, error: 'forbidden' };
@@ -389,18 +406,20 @@ const handlers = {
      * Админ: список всех конфигов
      */
     admin_list: (ws, data) => {
-        const all = store.allByCreator();
-        const likesMap = store.likesCountMap();
+        const app = store.sanitizeApp(data.app || data.script || data.namespace || 'default');
+        const all = store.allByCreatorApp(app);
+        const likesMap = store.likesCountMapForApp(app);
         
-        return { ok: true, configs_by_creator: all, likes: likesMap };
+        return { ok: true, app, configs_by_creator: all, likes: likesMap };
     },
     
     /**
      * Админ: дамп конфигов
      */
     admin_dump: (ws, data) => {
-        const all = store.allByCreator();
-        return { ok: true, dump: all };
+        const app = store.sanitizeApp(data.app || data.script || data.namespace || 'default');
+        const all = store.allByCreatorApp(app);
+        return { ok: true, app, dump: all };
     },
     
     /**
@@ -534,10 +553,11 @@ wss.on('connection', (ws, req) => {
 
 store.ensureDirs();
 
-server.listen(PORT, () => {
+server.listen(PORT, HOST, () => {
     console.log(`[SERVER] Curwe CloudConfig WebSocket server started`);
-    console.log(`[SERVER] Listening on port ${PORT}`);
-    console.log(`[SERVER] Health check: http://localhost:${PORT}/health`);
+    console.log(`[SERVER] Listening on ${HOST}:${PORT}`);
+    console.log(`[SERVER] Health check: http://${HOST}:${PORT}/health`);
+    console.log(`[SERVER] Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
 // Graceful shutdown

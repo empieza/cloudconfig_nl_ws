@@ -3,6 +3,8 @@
  * Полный перенос логики из PHP cloudconfig_store.php
  */
 
+require('dotenv').config();
+
 const fs = require('fs');
 const path = require('path');
 
@@ -11,8 +13,17 @@ const path = require('path');
 // ============================================
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-const USERS_DIR = path.join(DATA_DIR, 'users');
-const LIKES_FILE = path.join(DATA_DIR, 'likes.json');
+const APPS_DIR = path.join(DATA_DIR, 'apps');
+
+/**
+ * Legacy layout (до разделения по app):
+ *   DATA_DIR/users/*.json
+ *   DATA_DIR/likes.json
+ *
+ * New layout:
+ *   DATA_DIR/apps/<app>/users/*.json
+ *   DATA_DIR/apps/<app>/likes.json
+ */
 
 // ============================================
 // УТИЛИТЫ
@@ -26,6 +37,19 @@ function sanitizeUsername(raw) {
     const s = raw.trim();
     if (s === '' || s.length > 64) return '';
     if (!/^[a-zA-Z0-9_\-\.]+$/.test(s)) return '';
+    return s;
+}
+
+/**
+ * Нормализация имени приложения/версии (namespace).
+ * Примеры: "default", "dream"
+ */
+function sanitizeApp(raw) {
+    if (typeof raw !== 'string') return 'default';
+    const s = raw.trim().toLowerCase();
+    if (s === '') return 'default';
+    if (s.length > 32) return 'default';
+    if (!/^[a-z0-9_\-]+$/.test(s)) return 'default';
     return s;
 }
 
@@ -45,12 +69,35 @@ function userHash(username) {
     return crypto.createHash('sha256').update('nl:' + username.toLowerCase()).digest('hex');
 }
 
+function appPaths(app) {
+    const a = sanitizeApp(app);
+
+    if (a === 'default') {
+        return {
+            app: a,
+            dataDir: DATA_DIR,
+            usersDir: path.join(DATA_DIR, 'users'),
+            likesFile: path.join(DATA_DIR, 'likes.json'),
+            isLegacy: true
+        };
+    }
+
+    const dir = path.join(APPS_DIR, a);
+    return {
+        app: a,
+        dataDir: dir,
+        usersDir: path.join(dir, 'users'),
+        likesFile: path.join(dir, 'likes.json'),
+        isLegacy: false
+    };
+}
+
 /**
  * Путь к файлу пользователя
  */
-function userFile(username) {
+function userFile(app, username) {
     const hash = userHash(username);
-    return path.join(USERS_DIR, `${hash}.json`);
+    return path.join(appPaths(app).usersDir, `${hash}.json`);
 }
 
 /**
@@ -66,12 +113,20 @@ function entryOwnedByUser(config, requestUsername) {
 // РАБОТА С ДИРЕКТОРИЯМИ
 // ============================================
 
-function ensureDirs() {
+function ensureDirs(app = 'default') {
+    const p = appPaths(app);
+
     if (!fs.existsSync(DATA_DIR)) {
         fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o750 });
     }
-    if (!fs.existsSync(USERS_DIR)) {
-        fs.mkdirSync(USERS_DIR, { recursive: true, mode: 0o750 });
+    if (!p.isLegacy && !fs.existsSync(APPS_DIR)) {
+        fs.mkdirSync(APPS_DIR, { recursive: true, mode: 0o750 });
+    }
+    if (!fs.existsSync(p.dataDir)) {
+        fs.mkdirSync(p.dataDir, { recursive: true, mode: 0o750 });
+    }
+    if (!fs.existsSync(p.usersDir)) {
+        fs.mkdirSync(p.usersDir, { recursive: true, mode: 0o750 });
     }
 }
 
@@ -82,9 +137,9 @@ function ensureDirs() {
 /**
  * Чтение данных пользователя
  */
-function readUserData(username) {
-    ensureDirs();
-    const filePath = userFile(username);
+function readUserData(app, username) {
+    ensureDirs(app);
+    const filePath = userFile(app, username);
     
     if (!fs.existsSync(filePath)) {
         return { configs: [] };
@@ -108,9 +163,9 @@ function readUserData(username) {
 /**
  * Запись данных пользователя
  */
-function writeUserData(username, data) {
-    ensureDirs();
-    const filePath = userFile(username);
+function writeUserData(app, username, data) {
+    ensureDirs(app);
+    const filePath = userFile(app, username);
     const tmpPath = filePath + '.tmp';
     
     const payload = JSON.stringify(data, null, 0);
@@ -127,14 +182,19 @@ function writeUserData(username, data) {
  * @returns {Object.<string, string[]>} configId => [usernames]
  */
 function readLikes() {
-    ensureDirs();
-    
-    if (!fs.existsSync(LIKES_FILE)) {
+    return readLikesForApp('default');
+}
+
+function readLikesForApp(app) {
+    const p = appPaths(app);
+    ensureDirs(p.app);
+
+    if (!fs.existsSync(p.likesFile)) {
         return {};
     }
     
     try {
-        const raw = fs.readFileSync(LIKES_FILE, 'utf8');
+        const raw = fs.readFileSync(p.likesFile, 'utf8');
         if (!raw || raw.trim() === '') {
             return {};
         }
@@ -171,22 +231,31 @@ function readLikes() {
  * Запись файла лайков
  */
 function writeLikes(data) {
-    ensureDirs();
-    const tmpPath = LIKES_FILE + '.tmp';
+    writeLikesForApp('default', data);
+}
+
+function writeLikesForApp(app, data) {
+    const p = appPaths(app);
+    ensureDirs(p.app);
+    const tmpPath = p.likesFile + '.tmp';
     const payload = JSON.stringify(data);
     fs.writeFileSync(tmpPath, payload, { encoding: 'utf8', mode: 0o640 });
-    fs.renameSync(tmpPath, LIKES_FILE);
+    fs.renameSync(tmpPath, p.likesFile);
 }
 
 /**
  * Статистика лайков для конфига
  */
 function likesStats(configId, viewerUsername) {
+    return likesStatsForApp('default', configId, viewerUsername);
+}
+
+function likesStatsForApp(app, configId, viewerUsername) {
     if (!configId || !/^[a-f0-9]{32}$/.test(configId)) {
         return { count: 0, liked: false };
     }
     
-    const all = readLikes();
+    const all = readLikesForApp(app);
     const users = all[configId] || [];
     const viewer = viewerUsername.toLowerCase().trim();
     
@@ -200,6 +269,10 @@ function likesStats(configId, viewerUsername) {
  * Переключение лайка
  */
 function likeToggle(configId, likerUsername) {
+    return likeToggleForApp('default', configId, likerUsername);
+}
+
+function likeToggleForApp(app, configId, likerUsername) {
     if (!configId || !/^[a-f0-9]{32}$/.test(configId)) {
         return { ok: false, error: 'invalid_id' };
     }
@@ -209,7 +282,7 @@ function likeToggle(configId, likerUsername) {
         return { ok: false, error: 'invalid_username' };
     }
     
-    const config = findPublicById(configId);
+    const config = findPublicById(app, configId);
     if (!config) {
         return { ok: false, error: 'not_found' };
     }
@@ -219,7 +292,7 @@ function likeToggle(configId, likerUsername) {
         return { ok: false, error: 'own_config' };
     }
     
-    const all = readLikes();
+    const all = readLikesForApp(app);
     let list = all[configId] || [];
     
     // Фильтруем пустые значения
@@ -241,7 +314,7 @@ function likeToggle(configId, likerUsername) {
     }
     
     try {
-        writeLikes(all);
+        writeLikesForApp(app, all);
     } catch (e) {
         return { ok: false, error: 'server_error' };
     }
@@ -276,9 +349,13 @@ function listEntry(config) {
  * Добавление данных о лайках в запись
  */
 function enrichEntryLikes(entry, viewerUsername) {
+    return enrichEntryLikesForApp('default', entry, viewerUsername);
+}
+
+function enrichEntryLikesForApp(app, entry, viewerUsername) {
     try {
         const id = entry.id || '';
-        const stats = likesStats(id, viewerUsername);
+        const stats = likesStatsForApp(app, id, viewerUsername);
         entry.likes = stats.count;
         entry.liked = stats.liked;
     } catch (e) {
@@ -292,7 +369,11 @@ function enrichEntryLikes(entry, viewerUsername) {
  * Список конфигов пользователя
  */
 function listForUser(username) {
-    const data = readUserData(username);
+    return listForUserApp('default', username);
+}
+
+function listForUserApp(app, username) {
+    const data = readUserData(app, username);
     const out = [];
     
     for (const c of data.configs) {
@@ -320,13 +401,18 @@ function listForUser(username) {
  * Публичный список всех конфигов
  */
 function listPublic() {
-    ensureDirs();
+    return listPublicApp('default');
+}
+
+function listPublicApp(app) {
+    const p = appPaths(app);
+    ensureDirs(p.app);
     const out = [];
     
-    const files = fs.readdirSync(USERS_DIR).filter(f => f.endsWith('.json'));
+    const files = fs.readdirSync(p.usersDir).filter(f => f.endsWith('.json'));
     
     for (const file of files) {
-        const filePath = path.join(USERS_DIR, file);
+        const filePath = path.join(p.usersDir, file);
         try {
             const raw = fs.readFileSync(filePath, 'utf8');
             if (!raw || raw.trim() === '') continue;
@@ -368,7 +454,11 @@ function listPublic() {
  * Найти конфиг по ID для пользователя
  */
 function findById(username, id) {
-    const data = readUserData(username);
+    return findByIdApp('default', username, id);
+}
+
+function findByIdApp(app, username, id) {
+    const data = readUserData(app, username);
     
     for (const c of data.configs) {
         if (!c || typeof c !== 'object') continue;
@@ -385,13 +475,18 @@ function findById(username, id) {
  * Найти конфиг по ID среди всех пользователей
  */
 function findPublicById(id) {
+    return findPublicByIdApp('default', id);
+}
+
+function findPublicByIdApp(app, id) {
     if (!id || !/^[a-f0-9]{32}$/.test(id)) return null;
     
-    ensureDirs();
-    const files = fs.readdirSync(USERS_DIR).filter(f => f.endsWith('.json'));
+    const p = appPaths(app);
+    ensureDirs(p.app);
+    const files = fs.readdirSync(p.usersDir).filter(f => f.endsWith('.json'));
     
     for (const file of files) {
-        const filePath = path.join(USERS_DIR, file);
+        const filePath = path.join(p.usersDir, file);
         try {
             const raw = fs.readFileSync(filePath, 'utf8');
             if (!raw || raw.trim() === '') continue;
@@ -421,8 +516,12 @@ function findPublicById(id) {
  * Сохранение конфига (создание или обновление)
  */
 function save(username, name, payloadB64, existingId = null, isPinned = null, nameColor = null) {
+    return saveApp('default', username, name, payloadB64, existingId, isPinned, nameColor);
+}
+
+function saveApp(app, username, name, payloadB64, existingId = null, isPinned = null, nameColor = null) {
     const now = new Date().toISOString();
-    const data = readUserData(username);
+    const data = readUserData(app, username);
     let configs = data.configs;
     
     // Обновление существующего
@@ -456,9 +555,9 @@ function save(username, name, payloadB64, existingId = null, isPinned = null, na
             throw new Error('config not found');
         }
         
-        writeUserData(username, { configs: configs.filter(c => c && typeof c === 'object') });
+        writeUserData(app, username, { configs: configs.filter(c => c && typeof c === 'object') });
         
-        const updated = findById(username, existingId);
+        const updated = findByIdApp(app, username, existingId);
         return updated ? listEntry(updated) : {};
     }
     
@@ -475,7 +574,7 @@ function save(username, name, payloadB64, existingId = null, isPinned = null, na
     };
     
     configs.push(entry);
-    writeUserData(username, { configs: configs.filter(c => c && typeof c === 'object') });
+    writeUserData(app, username, { configs: configs.filter(c => c && typeof c === 'object') });
     
     return listEntry(entry);
 }
@@ -488,7 +587,11 @@ function save(username, name, payloadB64, existingId = null, isPinned = null, na
  * Удаление конфига
  */
 function deleteConfig(username, id) {
-    const data = readUserData(username);
+    return deleteConfigApp('default', username, id);
+}
+
+function deleteConfigApp(app, username, id) {
+    const data = readUserData(app, username);
     const configs = data.configs;
     const newList = [];
     let removed = false;
@@ -511,7 +614,7 @@ function deleteConfig(username, id) {
     }
     
     if (removed) {
-        writeUserData(username, { configs: newList.filter(c => c && typeof c === 'object') });
+        writeUserData(app, username, { configs: newList.filter(c => c && typeof c === 'object') });
         return { removed: true };
     }
     
@@ -526,6 +629,10 @@ function deleteConfig(username, id) {
  * Установка метаданных (только для Luvv1337)
  */
 function setMeta(actorUsername, id, isPinned, nameColor) {
+    return setMetaApp('default', actorUsername, id, isPinned, nameColor);
+}
+
+function setMetaApp(app, actorUsername, id, isPinned, nameColor) {
     if (actorUsername.toLowerCase() !== 'luvv1337') {
         throw new Error('forbidden');
     }
@@ -534,11 +641,12 @@ function setMeta(actorUsername, id, isPinned, nameColor) {
         throw new Error('invalid_id');
     }
     
-    ensureDirs();
-    const files = fs.readdirSync(USERS_DIR).filter(f => f.endsWith('.json'));
+    const p = appPaths(app);
+    ensureDirs(p.app);
+    const files = fs.readdirSync(p.usersDir).filter(f => f.endsWith('.json'));
     
     for (const file of files) {
-        const filePath = path.join(USERS_DIR, file);
+        const filePath = path.join(p.usersDir, file);
         try {
             const raw = fs.readFileSync(filePath, 'utf8');
             if (!raw || raw.trim() === '') continue;
@@ -596,14 +704,19 @@ function writeUserDataRaw(filePath, data) {
  * Все конфиги, сгруппированные по создателю
  */
 function allByCreator() {
-    ensureDirs();
+    return allByCreatorApp('default');
+}
+
+function allByCreatorApp(app) {
+    const p = appPaths(app);
+    ensureDirs(p.app);
     const out = {};
     
-    const files = fs.readdirSync(USERS_DIR).filter(f => f.endsWith('.json'));
+    const files = fs.readdirSync(p.usersDir).filter(f => f.endsWith('.json'));
     
     for (const file of files) {
         const base = file.replace('.json', '');
-        const filePath = path.join(USERS_DIR, file);
+        const filePath = path.join(p.usersDir, file);
         
         try {
             const raw = fs.readFileSync(filePath, 'utf8');
@@ -651,7 +764,11 @@ function allByCreator() {
  * Карта количества лайков
  */
 function likesCountMap() {
-    const all = readLikes();
+    return likesCountMapForApp('default');
+}
+
+function likesCountMapForApp(app) {
+    const all = readLikesForApp(app);
     const out = {};
     
     for (const [cid, users] of Object.entries(all)) {
@@ -670,6 +787,7 @@ function likesCountMap() {
 module.exports = {
     // Утилиты
     sanitizeUsername,
+    sanitizeApp,
     generateId,
     
     // Списки
@@ -696,5 +814,20 @@ module.exports = {
     allByCreator,
     
     // Инициализация
-    ensureDirs
+    ensureDirs,
+
+    // Multi-app API
+    appPaths,
+    listForUserApp,
+    listPublicApp,
+    enrichEntryLikesForApp,
+    findByIdApp,
+    findPublicByIdApp,
+    saveApp,
+    deleteConfigApp,
+    setMetaApp,
+    likesStatsForApp,
+    likeToggleForApp,
+    likesCountMapForApp,
+    allByCreatorApp
 };

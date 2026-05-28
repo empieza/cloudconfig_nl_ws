@@ -12,6 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const store = require('./store');
 const leaderboard = require('./leaderboard_store');
+const verifyStore = require('./verify_store');
 
 // ============================================
 // КОНФИГУРАЦИЯ
@@ -21,6 +22,7 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 const API_SECRET = process.env.CLOUD_API_SECRET || '';
 const ADMIN_SECRET = process.env.CLOUD_ADMIN_SECRET || '';
+const VERIFY_API_SECRET = process.env.VERIFY_API_SECRET || API_SECRET;
 
 // Онлайн пользователи
 const ONLINE_TTL_MS = Math.max(10000, Math.min(parseInt(process.env.SCRIPT_ONLINE_TTL_MS || '60000', 10), 600000));
@@ -161,7 +163,7 @@ const server = http.createServer((req, res) => {
             try {
                 const raw = Buffer.concat(chunks).toString('utf8');
                 const data = raw ? JSON.parse(raw) : {};
-                const token = String(data.admin_token || '');
+                const token = readAdminTokenFromRequest(data, req);
                 if (!verifyAdminToken(token)) {
                     res.writeHead(401, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ ok: false, error: 'admin_unauthorized' }));
@@ -175,6 +177,61 @@ const server = http.createServer((req, res) => {
                     result = leaderboard.resetApp(store.sanitizeApp(appRaw));
                 }
                 console.log(`[LB] reset app=${appRaw} by admin`);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(result));
+            } catch (e) {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: 'server_error' }));
+            }
+        });
+        return;
+    }
+
+    // Verify: выдача кода (Lua / PHP proxy) POST { token, username, app }
+    if (reqPath === '/verify/generate' && req.method === 'POST') {
+        const chunks = [];
+        req.on('data', (chunk) => chunks.push(chunk));
+        req.on('end', () => {
+            try {
+                const raw = Buffer.concat(chunks).toString('utf8');
+                const data = raw ? JSON.parse(raw) : {};
+                const token = String(data.token || req.headers['x-verify-api-secret'] || '');
+                if (!verifyVerifyToken(token)) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+                    return;
+                }
+                const username = verifyStore.sanitizeUsername(
+                    data.username || req.headers['x-curwe-nl-username'] || req.headers['x-nl-username'] || ''
+                );
+                const app = verifyStore.sanitizeVerifyApp(data.app || data.script || 'default');
+                const result = verifyStore.generateForUser(username, app);
+                const code = result.ok ? 200 : (result.error === 'rate_limited' ? 429 : 400);
+                res.writeHead(code, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(result));
+            } catch (e) {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: 'server_error' }));
+            }
+        });
+        return;
+    }
+
+    // Verify: проверка кода (Discord bot) POST { token, code }
+    if (reqPath === '/verify/consume' && req.method === 'POST') {
+        const chunks = [];
+        req.on('data', (chunk) => chunks.push(chunk));
+        req.on('end', () => {
+            try {
+                const raw = Buffer.concat(chunks).toString('utf8');
+                const data = raw ? JSON.parse(raw) : {};
+                const token = String(data.token || req.headers['x-verify-api-secret'] || '');
+                if (!verifyVerifyToken(token)) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+                    return;
+                }
+                const result = verifyStore.consumeCode(data.code || '');
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify(result));
             } catch (e) {
@@ -241,15 +298,34 @@ function verifyToken(provided) {
 
 function verifyAdminToken(provided) {
     if (!ADMIN_SECRET || ADMIN_SECRET.length < 16) return false;
-    if (!provided) return false;
+    if (!provided || typeof provided !== 'string') return false;
+    const a = Buffer.from(ADMIN_SECRET, 'utf8');
+    const b = Buffer.from(provided, 'utf8');
+    if (a.length !== b.length) return false;
     try {
-        return crypto.timingSafeEqual(
-            Buffer.from(ADMIN_SECRET, 'utf8'),
-            Buffer.from(provided, 'utf8')
-        );
+        return crypto.timingSafeEqual(a, b);
     } catch (e) {
         return false;
     }
+}
+
+function verifyVerifyToken(provided) {
+    if (!VERIFY_API_SECRET || VERIFY_API_SECRET.length < 16) return false;
+    if (!provided || typeof provided !== 'string') return false;
+    const a = Buffer.from(VERIFY_API_SECRET, 'utf8');
+    const b = Buffer.from(provided, 'utf8');
+    if (a.length !== b.length) return false;
+    try {
+        return crypto.timingSafeEqual(a, b);
+    } catch (e) {
+        return false;
+    }
+}
+
+function readAdminTokenFromRequest(data, req) {
+    const fromBody = data && data.admin_token ? String(data.admin_token) : '';
+    const fromHdr = req && req.headers ? (req.headers['x-cloud-admin-secret'] || req.headers['X-Cloud-Admin-Secret'] || '') : '';
+    return fromBody || String(fromHdr || '');
 }
 
 // ============================================
@@ -531,7 +607,19 @@ const handlers = {
         const limit = parseInt(data.limit, 10) || 15;
         const result = leaderboard.listTopForLua(app, limit);
         return result;
-    }
+    },
+
+    /**
+     * Verify: постоянный код для NL-ника (app = default/old или dream)
+     */
+    verify_generate: (ws, data) => {
+        const username = verifyStore.sanitizeUsername(data.username || '');
+        const app = verifyStore.sanitizeVerifyApp(data.app || data.script || 'default');
+        if (!username) {
+            return { ok: false, error: 'invalid_username' };
+        }
+        return verifyStore.generateForUser(username, app);
+    },
 };
 
 // ============================================
@@ -633,6 +721,7 @@ wss.on('connection', (ws, req) => {
 // ============================================
 
 store.ensureDirs();
+verifyStore.ensureDirs();
 
 server.listen(PORT, HOST, () => {
     console.log(`[SERVER] Curwe CloudConfig WebSocket server started`);

@@ -104,7 +104,7 @@ function getOnlineCount(nowMs) {
 const server = http.createServer((req, res) => {
     // CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     
     if (req.method === 'OPTIONS') {
@@ -150,6 +150,38 @@ const server = http.createServer((req, res) => {
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, error: 'server_error' }));
         }
+        return;
+    }
+
+    // Admin: полный сброс leaderboard (POST JSON { admin_token, app: "dream"|"default"|"all" })
+    if (reqPath === '/leaderboard/reset' && req.method === 'POST') {
+        const chunks = [];
+        req.on('data', (chunk) => chunks.push(chunk));
+        req.on('end', () => {
+            try {
+                const raw = Buffer.concat(chunks).toString('utf8');
+                const data = raw ? JSON.parse(raw) : {};
+                const token = String(data.admin_token || '');
+                if (!verifyAdminToken(token)) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: 'admin_unauthorized' }));
+                    return;
+                }
+                const appRaw = String(data.app || 'default').toLowerCase().trim();
+                let result;
+                if (appRaw === 'all') {
+                    result = leaderboard.resetAll();
+                } else {
+                    result = leaderboard.resetApp(store.sanitizeApp(appRaw));
+                }
+                console.log(`[LB] reset app=${appRaw} by admin`);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(result));
+            } catch (e) {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: 'server_error' }));
+            }
+        });
         return;
     }
     
@@ -565,6 +597,9 @@ wss.on('connection', (ws, req) => {
         
         try {
             const result = handler(ws, data);
+            if (action === 'leaderboard_sync' && result && result.ok) {
+                console.log(`[LB] sync ${username} app=${data.app || 'default'} pts+${(data.delta && data.delta.points) || 0}`);
+            }
             sendJson(ws, {
                 request_id: requestId,
                 ...result

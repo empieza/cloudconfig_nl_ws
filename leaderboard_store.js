@@ -208,10 +208,47 @@ function listTopForLua(app, limit) {
     };
 }
 
+/**
+ * Полный сброс leaderboard для одного app (players.json).
+ */
+function resetApp(app) {
+    const a = sanitizeApp(app);
+    writeAll(a, { players: {} });
+    return { ok: true, app: a, cleared: true };
+}
+
+/**
+ * Сброс default + всех app в DATA_DIR/apps/
+ */
+function resetAll() {
+    const cleared = [];
+    resetApp('default');
+    cleared.push('default');
+
+    const appsRoot = path.join(DATA_DIR, 'apps');
+    if (fs.existsSync(appsRoot)) {
+        for (const name of fs.readdirSync(appsRoot)) {
+            if (!name || name.startsWith('.')) continue;
+            const lb = path.join(appsRoot, name, 'leaderboard');
+            if (!fs.existsSync(lb)) continue;
+            try {
+                resetApp(name);
+                cleared.push(name);
+            } catch (e) {
+                // skip broken dirs
+            }
+        }
+    }
+
+    return { ok: true, app: 'all', cleared_apps: cleared };
+}
+
 module.exports = {
     sanitizeUsername,
     applySync,
     listTop,
     listTopForLua,
+    resetApp,
+    resetAll,
     ONLINE_TTL_MS,
 };

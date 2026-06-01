@@ -13,6 +13,7 @@ const path = require('path');
 const store = require('./store');
 const leaderboard = require('./leaderboard_store');
 const verifyStore = require('./verify_store');
+const hwidStore = require('./hwid_store');
 
 // ============================================
 // КОНФИГУРАЦИЯ
@@ -217,6 +218,64 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    // HWID: регистрация (Discord bot) POST { token, discord_id, discord_tag, hwid }
+    if (reqPath === '/hwid/register' && req.method === 'POST') {
+        const chunks = [];
+        req.on('data', (chunk) => chunks.push(chunk));
+        req.on('end', () => {
+            try {
+                const raw = Buffer.concat(chunks).toString('utf8');
+                const data = raw ? JSON.parse(raw) : {};
+                const token = String(data.token || req.headers['x-verify-api-secret'] || req.headers['x-hwid-api-secret'] || '');
+                if (!verifyVerifyToken(token)) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+                    return;
+                }
+                const result = hwidStore.register(
+                    data.discord_id || '',
+                    data.discord_tag || '',
+                    data.hwid || data.key || ''
+                );
+                const code = result.ok ? 200 : (result.error === 'hwid_taken' ? 409 : 400);
+                if (result.ok) {
+                    console.log(`[HWID] register discord=${result.discord_id} hwid=${String(result.hwid).substring(0, 16)}…`);
+                }
+                res.writeHead(code, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(result));
+            } catch (e) {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: 'server_error' }));
+            }
+        });
+        return;
+    }
+
+    // HWID: проверка (GameSense Lua) POST { token, hwid }
+    if (reqPath === '/hwid/check' && req.method === 'POST') {
+        const chunks = [];
+        req.on('data', (chunk) => chunks.push(chunk));
+        req.on('end', () => {
+            try {
+                const raw = Buffer.concat(chunks).toString('utf8');
+                const data = raw ? JSON.parse(raw) : {};
+                const token = String(data.token || req.headers['x-verify-api-secret'] || req.headers['x-hwid-api-secret'] || '');
+                if (!verifyVerifyToken(token)) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+                    return;
+                }
+                const result = hwidStore.check(data.hwid || data.key || '');
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(result));
+            } catch (e) {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: 'server_error' }));
+            }
+        });
+        return;
+    }
+
     // Verify: проверка кода (Discord bot) POST { token, code }
     if (reqPath === '/verify/consume' && req.method === 'POST') {
         const chunks = [];
@@ -241,7 +300,7 @@ const server = http.createServer((req, res) => {
         });
         return;
     }
-    
+
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('Not Found');
 });
@@ -620,6 +679,28 @@ const handlers = {
         }
         return verifyStore.generateForUser(username, app);
     },
+
+    /**
+     * HWID: проверка привязки (GameSense)
+     */
+    hwid_check: (ws, data) => {
+        const hwid = hwidStore.sanitizeHwid(data.hwid || data.key || '');
+        if (!hwid) {
+            return { ok: false, error: 'invalid_hwid' };
+        }
+        return hwidStore.check(hwid);
+    },
+
+    /**
+     * HWID: регистрация из Lua (discord_id опционально — обычно через /register в Discord)
+     */
+    hwid_register: (ws, data) => {
+        return hwidStore.register(
+            data.discord_id || '',
+            data.discord_tag || '',
+            data.hwid || data.key || ''
+        );
+    },
 };
 
 // ============================================
@@ -661,7 +742,12 @@ wss.on('connection', (ws, req) => {
         
         authenticated = true;
         username = store.sanitizeUsername(data.username || '');
-        
+
+        // HWID-only запросы (GameSense) — username не обязателен
+        if (!username && (action === 'hwid_check' || action === 'hwid_register')) {
+            username = 'gs_hwid';
+        }
+
         if (!username) {
             sendError(ws, requestId, 'invalid_username');
             return;
@@ -722,6 +808,7 @@ wss.on('connection', (ws, req) => {
 
 store.ensureDirs();
 verifyStore.ensureDirs();
+hwidStore.ensureDirs();
 
 server.listen(PORT, HOST, () => {
     console.log(`[SERVER] Curwe CloudConfig WebSocket server started`);
